@@ -1,24 +1,8 @@
 """
-Shopify Checkout Engine — V13 WORKING
-=======================================
-Full newss API compatible payload format.
-
-Key Fixes (from newss source):
-- buyerIdentity.customer (NOT buyerIdentity.buyerIdentity)
-- email field (NOT contactInfoV2.emailOrSms)
-- emailChanged field
-- paymentMethodIdentifier REMOVED from payment
-- proposedTotalAmount = {"any": True}
-- marketingConsent = []
-- rememberMe = False
-- phoneCountryCode = "US"
-
-Flow:
-- /checkouts/unstable/graphql (full query, not persisted ID)
-- /cart/add.js + /cart POST
-- 3 PCI endpoints fallback
-- SOFT_ERRORS retry
-- Cheapest product selection
+Shopify Checkout Engine — V14 WORKING
+======================================
+Poll retry on GENERIC_ERROR + ProcessingReceipt.
+newss API compatible payload.
 """
 
 import asyncio
@@ -54,6 +38,7 @@ GATE_NAME = "Shopify Payments"
 IMPERSONATE = "chrome124"
 
 SOFT_ERRORS = {"WAITING_PENDING_TERMS", "TAX_NEW_TAX_MUST_BE_ACCEPTED"}
+RETRY_ERRORS = {"GENERIC_ERROR", "PROCESSING_ERROR", "UNKNOWN"}
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -159,7 +144,6 @@ _SHOPIFY_ERROR_MAP: Dict[str, str] = {
     "too many": "THROTTLED",
     "rate limit": "THROTTLED",
     "gateway": "GATEWAY_ERROR",
-    "processing error": "PROCESSING_ERROR",
     "inventory": "OUT_OF_STOCK",
     "out of stock": "OUT_OF_STOCK",
     "unavailable": "OUT_OF_STOCK",
@@ -170,9 +154,7 @@ _SHOPIFY_ERROR_MAP: Dict[str, str] = {
     "no_session_token": "NO_SESSION_TOKEN",
     "tokenization": "TOKENIZATION_FAILED",
     "tokenize": "TOKENIZATION_FAILED",
-    "generic_error": "CARD_DECLINED",
-    "generic error": "CARD_DECLINED",
-    "generic": "CARD_DECLINED",
+    # ⭐ GENERIC_ERROR မထည့် — retry လုပ်ရမယ်
     "there was a problem processing your order": "CARD_DECLINED",
     "problem processing": "CARD_DECLINED",
     "processing your order": "CARD_DECLINED",
@@ -197,6 +179,10 @@ def _map_error(raw: str) -> str:
     if not raw:
         return ""
     low = raw.lower().strip()
+    # ⭐ Retry errors ကို မဖြတ်
+    upper = raw.upper().strip()
+    if upper in ("GENERIC_ERROR", "PROCESSING_ERROR", "UNKNOWN"):
+        return upper
     sorted_keys = sorted(_SHOPIFY_ERROR_MAP.keys(), key=len, reverse=True)
     for keyword in sorted_keys:
         if keyword in low:
@@ -211,7 +197,7 @@ _SUBMIT_QUERY = """mutation SubmitForCompletion($input:NegotiationInput!,$attemp
 _POLL_QUERY = """query PollForReceipt($receiptId:ID!,$sessionToken:String!){receipt(receiptId:$receiptId,sessionInput:{sessionToken:$sessionToken}){...ReceiptDetails __typename}}fragment ReceiptDetails on Receipt{...on ProcessedReceipt{id token orderIdentity{buyerIdentifier id __typename}__typename}...on ProcessingReceipt{id pollDelay __typename}...on ActionRequiredReceipt{id action{...on CompletePaymentChallenge{offsiteRedirect url __typename}__typename}__typename}...on FailedReceipt{id processingError{...on PaymentFailed{code messageUntranslated __typename}__typename}__typename}__typename}"""
 
 
-# ──────────────────────── Shopify Engine (async) ─────────────────────
+# ──────────────────────── Shopify Engine ─────────────────────────────
 
 class ShopifyEngine:
     def __init__(self, shop_url: str, proxy_url: str = ""):
@@ -228,7 +214,6 @@ class ShopifyEngine:
         self.payment_method_id: Optional[str] = None
         self.payment_session_id: Optional[str] = None
 
-        # Price tracking
         self.product_price: str = ""
         self.checkout_total: str = ""
 
@@ -351,7 +336,7 @@ class ShopifyEngine:
         logger.info("Selected product: %r price=$%.2f", self.product["title"], self.product["price"])
         return self.product
 
-    # ── step 1: visit product page ──
+    # ── step 1 ──
 
     async def visit_product_page(self) -> bool:
         p = await self.get_products()
@@ -364,7 +349,7 @@ class ShopifyEngine:
                             })
         return bool(r and r.status_code == 200)
 
-    # ── step 2: add to cart ──
+    # ── step 2 ──
 
     async def add_to_cart(self) -> Optional[str]:
         p = await self.get_products()
@@ -392,7 +377,7 @@ class ShopifyEngine:
         self.cart_token = cd.get("token")
         return self.cart_token
 
-    # ── step 3: init checkout ──
+    # ── step 3 ──
 
     async def init_checkout(self) -> bool:
         headers = {
@@ -428,9 +413,18 @@ class ShopifyEngine:
         if m:
             self.checkout_total = m.group(1)
 
+        # ⭐ Debug log
+        logger.info(
+            "checkout init — session=%s queue=%s stable=%s pm=%s",
+            (self.session_token or "MISS")[:20],
+            (self.queue_token or "MISS")[:20],
+            (self.stable_id or "MISS")[:20],
+            (self.payment_method_id or "MISS")[:20],
+        )
+
         return all([self.session_token, self.queue_token, self.stable_id, self.payment_method_id])
 
-    # ── step 4: PCI tokenization ──
+    # ── step 4 ──
 
     async def create_payment_session(self, cc: str, mon, year, cvv) -> Optional[str]:
         ui = self.get_user_info()
@@ -473,7 +467,7 @@ class ShopifyEngine:
                 continue
         return None
 
-    # ── step 5: build payload (NEWSS FORMAT) ──
+    # ── step 5: payload ──
 
     def _build_submit_payload(self) -> Dict:
         ui = self.get_user_info()
@@ -539,12 +533,12 @@ class ShopifyEngine:
                         }]
                     },
                     "memberships": {"memberships": []},
-                    # ⭐ NEWSS FORMAT — payment (NO paymentMethodIdentifier)
                     "payment": {
                         "totalAmount": {"any": True},
                         "paymentLines": [{
                             "paymentMethod": {
                                 "directPaymentMethod": {
+                                    "paymentMethodIdentifier": self.payment_method_id,
                                     "sessionId": self.payment_session_id,
                                     "billingAddress": {"streetAddress": addr},
                                     "cardSource": None,
@@ -555,7 +549,6 @@ class ShopifyEngine:
                         }],
                         "billingAddress": {"streetAddress": addr},
                     },
-                    # ⭐ NEWSS FORMAT — buyerIdentity
                     "buyerIdentity": {
                         "customer": {"presentmentCurrency": "USD", "countryCode": "US"},
                         "email": ui["email"],
@@ -593,7 +586,7 @@ class ShopifyEngine:
             "operationName": "SubmitForCompletion",
         }
 
-    # ── step 6: submit payment ──
+    # ── step 6 ──
 
     async def submit_payment(self) -> Dict:
         if not all([self.session_token, self.payment_session_id, self.cart_token]):
@@ -676,11 +669,20 @@ class ShopifyEngine:
 
         return {"status": "unknown"}
 
-    # ── step 7: poll for receipt ──
+    # ── step 7: poll with retry ──
 
     async def _poll_receipt(self, rid: str, headers: Dict) -> Dict:
-        for i in range(5):
-            await asyncio.sleep(1.5)
+        """
+        Poll for receipt with retry on GENERIC_ERROR / ProcessingReceipt.
+        - Up to 10 polls, 2s each = 20s max
+        - GENERIC_ERROR / PROCESSING_ERROR / UNKNOWN → retry
+        - ProcessingReceipt → retry
+        - ProcessedReceipt → CHARGED
+        - ActionRequiredReceipt → 3DS
+        - CARD_DECLINED / INSUFFICIENT_FUNDS → DECLINED
+        """
+        for i in range(10):
+            await asyncio.sleep(2.0)
             try:
                 session = await self._get_session()
                 r = await session.post(
@@ -703,23 +705,40 @@ class ShopifyEngine:
                 receipt = data.get("data", {}).get("receipt", {})
                 tn = receipt.get("__typename")
 
+                # ⭐ CHARGED
                 if tn == "ProcessedReceipt" or "orderIdentity" in receipt:
                     oid = receipt.get("orderIdentity", {}).get("id", "N/A")
                     return {"status": "charged", "order_id": oid}
 
+                # ⭐ 3DS
                 elif tn == "ActionRequiredReceipt":
                     return {"status": "3ds_required", "data": data}
 
+                # ⭐ Still processing → retry
+                elif tn == "ProcessingReceipt":
+                    logger.info("poll #%d still processing, retry...", i)
+                    continue
+
+                # ⭐ FailedReceipt → check code
                 elif tn == "FailedReceipt":
                     pe = receipt.get("processingError", {})
                     code = pe.get("code", "CARD_DECLINED")
                     msg = pe.get("messageUntranslated", "")
+
+                    # ⭐ GENERIC_ERROR → retry
+                    if code.upper() in RETRY_ERRORS:
+                        logger.info("poll #%d %s → retry...", i, code)
+                        continue
+
+                    # ⭐ Final decline
                     mapped = _map_error(code) or _map_error(msg) or "CARD_DECLINED"
                     logger.info("poll #%d FailedReceipt code=%s msg=%s", i, code, msg)
                     return {"status": "declined", "code": mapped, "message": msg}
+
             except Exception as e:
                 logger.warning("poll #%d exception: %s", i, e)
                 continue
+
         return {"status": "timeout"}
 
     # ── full checkout ──
@@ -732,8 +751,10 @@ class ShopifyEngine:
                 return {"status": "failed", "step": 2, "reason": "CART_FAILED"}
             if not await self.init_checkout():
                 return {"status": "failed", "step": 3, "reason": "NO_SESSION_TOKEN"}
+            await asyncio.sleep(0.3)
             if not await self.create_payment_session(cc, mon, year, cvv):
                 return {"status": "failed", "step": 4, "reason": "TOKENIZATION_FAILED"}
+            await asyncio.sleep(0.3)
             return await self.submit_payment()
         except Exception as e:
             logger.warning("checkout exception: %s", e)
@@ -810,7 +831,6 @@ async def _run_checkout_async(shop_url: str, card_entry: str, proxy_url: str = "
         await engine.close()
 
     status = r.get("status", "unknown")
-
     price_value = engine.checkout_total or engine.product_price or ""
     if price_value:
         price_value = str(price_value).replace(" USD", "").replace("$", "").strip()
@@ -900,5 +920,5 @@ def run_checkout_for_card(shop_url: str, card_entry: str, proxy_url: str = "", l
         if "already running" in str(e).lower() or "no running event loop" in str(e).lower():
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 future = pool.submit(_run)
-                return future.result(timeout=REQUEST_TIMEOUT + 30)
+                return future.result(timeout=REQUEST_TIMEOUT + 60)
         raise
