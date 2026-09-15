@@ -1,15 +1,24 @@
 """
-Shopify Checkout Engine — V12
-==============================
-Async + curl_cffi (chrome124) + full GraphQL query.
-Bot.py compatible — Response/Price/Gate format မှန်ကန်.
+Shopify Checkout Engine — V13 WORKING
+=======================================
+Full newss API compatible payload format.
 
-Key Fixes:
-- Poll log for debugging
-- amount clean (no " USD")
-- _poll_receipt() sleep 1.5s (5 attempts = 7.5s)
-- UNKNOWN → CARD_DECLINED
-- Shipping method names mapped
+Key Fixes (from newss source):
+- buyerIdentity.customer (NOT buyerIdentity.buyerIdentity)
+- email field (NOT contactInfoV2.emailOrSms)
+- emailChanged field
+- paymentMethodIdentifier REMOVED from payment
+- proposedTotalAmount = {"any": True}
+- marketingConsent = []
+- rememberMe = False
+- phoneCountryCode = "US"
+
+Flow:
+- /checkouts/unstable/graphql (full query, not persisted ID)
+- /cart/add.js + /cart POST
+- 3 PCI endpoints fallback
+- SOFT_ERRORS retry
+- Cheapest product selection
 """
 
 import asyncio
@@ -464,17 +473,23 @@ class ShopifyEngine:
                 continue
         return None
 
-    # ── step 5: build payload ──
+    # ── step 5: build payload (NEWSS FORMAT) ──
 
     def _build_submit_payload(self) -> Dict:
         ui = self.get_user_info()
         p = self.product
         vid = p["variant_id"]
         addr = {
-            "address1": ui["add"], "address2": "", "city": ui["city"],
-            "countryCode": "US", "postalCode": ui["zip"], "company": "",
-            "firstName": ui["fname"], "lastName": ui["lname"],
-            "zoneCode": ui["state_short"], "phone": ui["phone"],
+            "address1": ui["add"],
+            "address2": "",
+            "city": ui["city"],
+            "countryCode": "US",
+            "postalCode": ui["zip"],
+            "company": "",
+            "firstName": ui["fname"],
+            "lastName": ui["lname"],
+            "zoneCode": ui["state_short"],
+            "phone": ui["phone"],
         }
 
         return {
@@ -503,6 +518,7 @@ class ShopifyEngine:
                         "noDeliveryRequired": [],
                         "useProgressiveRates": False,
                         "prefetchShippingRatesStrategy": None,
+                        "supportsSplitShipping": True,
                     },
                     "merchandise": {
                         "merchandiseLines": [{
@@ -522,12 +538,13 @@ class ShopifyEngine:
                             "lineComponents": [],
                         }]
                     },
+                    "memberships": {"memberships": []},
+                    # ⭐ NEWSS FORMAT — payment (NO paymentMethodIdentifier)
                     "payment": {
                         "totalAmount": {"any": True},
                         "paymentLines": [{
                             "paymentMethod": {
                                 "directPaymentMethod": {
-                                    "paymentMethodIdentifier": self.payment_method_id,
                                     "sessionId": self.payment_session_id,
                                     "billingAddress": {"streetAddress": addr},
                                     "cardSource": None,
@@ -538,16 +555,20 @@ class ShopifyEngine:
                         }],
                         "billingAddress": {"streetAddress": addr},
                     },
+                    # ⭐ NEWSS FORMAT — buyerIdentity
                     "buyerIdentity": {
-                        "buyerIdentity": {"presentmentCurrency": "USD", "countryCode": "US"},
-                        "contactInfoV2": {"emailOrSms": {"value": ui["email"], "emailOrSmsChanged": False}},
-                        "marketingConsent": [{"email": {"value": ui["email"]}}],
+                        "customer": {"presentmentCurrency": "USD", "countryCode": "US"},
+                        "email": ui["email"],
+                        "emailChanged": False,
+                        "phoneCountryCode": "US",
+                        "marketingConsent": [],
                         "shopPayOptInPhone": {"countryCode": "US"},
+                        "rememberMe": False,
                     },
                     "tip": {"tipLines": []},
                     "taxes": {
                         "proposedAllocations": None,
-                        "proposedTotalAmount": {"value": {"amount": "0", "currencyCode": "USD"}},
+                        "proposedTotalAmount": {"any": True},
                         "proposedTotalIncludedAmount": None,
                         "proposedMixedStateTotalAmount": None,
                         "proposedExemptions": [],
@@ -563,6 +584,7 @@ class ShopifyEngine:
                         "shippingScriptChanges": [],
                     },
                     "optionalDuties": {"buyerRefusesDuties": False},
+                    "cartMetafields": [],
                 },
                 "attemptToken": f"{self.cart_token}-{random.random()}",
                 "metafields": [],
@@ -653,6 +675,8 @@ class ShopifyEngine:
                 return {"status": "failed", "reason": str(e)}
 
         return {"status": "unknown"}
+
+    # ── step 7: poll for receipt ──
 
     async def _poll_receipt(self, rid: str, headers: Dict) -> Dict:
         for i in range(5):
@@ -787,7 +811,6 @@ async def _run_checkout_async(shop_url: str, card_entry: str, proxy_url: str = "
 
     status = r.get("status", "unknown")
 
-    # ⭐ Price ကို " USD" မပါအောင် clean
     price_value = engine.checkout_total or engine.product_price or ""
     if price_value:
         price_value = str(price_value).replace(" USD", "").replace("$", "").strip()
