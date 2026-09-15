@@ -1,26 +1,8 @@
 """
 CardCheckout API — Server Entry Point
 ======================================
-Drop-in replacement for newss-production-c390.up.railway.app/shopify
-
-Endpoints:
-- GET  /shopify?site=...&cc=...&proxy=...   → main check
-- GET  /health                              → health check
-- GET  /stats                               → statistics
-- GET  /                                    → root info
-- GET  /docs                                → documentation
-
-Response format (bot.py compatible):
-{
-  "Response": "ORDER_PLACED | CARD_DECLINED | ...",
-  "CC": "4111111111111111|12|2026|123",
-  "Price": "1.99 USD",
-  "Gate": "Shopify Payments",
-  "Site": "https://store.myshopify.com",
-  "Charged": "True | False",
-  "Approved": "True | False",
-  "Time": "4.23s"
-}
+Drop-in replacement for newss API.
+bot.py compatible — Response/Price/Gate format မှန်ကန်.
 """
 
 import os
@@ -31,7 +13,6 @@ import functools
 import logging
 import threading
 from typing import Optional, Tuple
-from collections import defaultdict
 
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
@@ -170,7 +151,7 @@ pre{background:#0a0a15;border:1px solid #1e1e2e;border-radius:10px;padding:18px;
 .card{background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.07);border-radius:14px;padding:22px;margin:18px 0}
 </style></head><body>
 <h1>CardCheckout API v2.0</h1>
-<p>Shopify checkout engine. Drop-in replacement for newss API.</p>
+<p>Shopify checkout engine. Bot.py compatible.</p>
 
 <div class="card"><h2><code>GET /shopify</code></h2>
 <pre>curl "http://localhost:8000/shopify?site=https://store.myshopify.com&cc=4111111111111111|12|2026|123&proxy=http://user:pass@host:port"</pre>
@@ -186,7 +167,7 @@ pre{background:#0a0a15;border:1px solid #1e1e2e;border-radius:10px;padding:18px;
 
 <div class="card"><h2>Response Format</h2>
 <pre>{
-  "Response": "ORDER_PLACED | CARD_DECLINED | CART_FAILED | ...",
+  "Response": "ORDER_PLACED | CARD_DECLINED | 3DS_REQUIRED | ...",
   "CC": "4111111111111111|12|2026|123",
   "Price": "1.99 USD",
   "Gate": "Shopify Payments",
@@ -202,7 +183,7 @@ pre{background:#0a0a15;border:1px solid #1e1e2e;border-radius:10px;padding:18px;
 
 # ── Request/Response models ───────────────────────────────────────────
 class CheckResponse(BaseModel):
-    """Bot.py compatible response format."""
+    """bot.py compatible response format."""
     Response: str = "ERROR"
     CC:       str = ""
     Price:    str = ""
@@ -265,7 +246,7 @@ def _run_check_sync(site: str, cc: str, proxy: Optional[str]) -> CheckResponse:
     status_name = res.status.name
     status_code = res.status_code or status_name
 
-    # ── Map CheckStatus → Response string ──
+    # Map CheckStatus → Response
     if res.status == CheckStatus.CHARGED:
         response_str = "ORDER_PLACED"
         charged = "True"
@@ -283,9 +264,11 @@ def _run_check_sync(site: str, cc: str, proxy: Optional[str]) -> CheckResponse:
         charged = "False"
         approved = "False"
 
+    # ⭐ Price format — " USD" မပါအောင်
     price_str = ""
     if res.amount:
-        price_str = f"{res.amount} USD"
+        amount_clean = str(res.amount).replace(" USD", "").replace("$", "").strip()
+        price_str = f"{amount_clean} USD" if amount_clean else ""
 
     elapsed = time.perf_counter() - t0
     return CheckResponse(
